@@ -1,3 +1,0 @@
-ticket_id,plate,helmet,helmet_color,face_embedding_path,clothes_embedding_path,checkin_image,checkout_image,status
-1,99E1-2226,yes,non-helmet,embeddings\1_face.npy,,captures/in_1_person.jpg,,ACTIVE
-2,54L1-9999,yes,non-helmet,embeddings\2_face.npy,,captures/in_2_person.jpg,captures/out_2_person.jpg,DONE
