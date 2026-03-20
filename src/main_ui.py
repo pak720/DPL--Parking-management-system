@@ -70,11 +70,12 @@ class CameraWorker(QThread):
         self.MIN_CHECKIN_GAP = 5.0  
         self.STABLE_REQUIRED_SECONDS = 5.0  
         self.EVENT_MESSAGE_HOLD_SECONDS = 5.0  
-        self.PERSON_INFER_SCALE = 0.7  
+        self.PERSON_INFER_SCALE = 0.5  
         self.FACE_PLATE_LOCK_THRESHOLD = 0.78  
         
     def optimize_camera(self, cap, width=None, height=None):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
         if width is not None and height is not None:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -164,6 +165,62 @@ class CameraWorker(QThread):
             if plate_text is None: return False
             return any(rx.fullmatch(str(plate_text).upper().strip()) for rx in PLATE_FORMAT_REGEXES)
 
+        def split_plate_parts(plate_text):
+            if plate_text is None:
+                return None, None
+            plate_text = str(plate_text).upper().strip()
+            if "-" not in plate_text:
+                return None, None
+            head, tail = plate_text.rsplit("-", 1)
+            if not tail.isdigit():
+                return None, None
+            return head, tail
+
+        def detect_missing_last_digit_ambiguity(selected_plate, ocr_candidates):
+            """
+            Detect case where selected plate is 4-digit tail but OCR recently saw
+            a 5-digit tail with same prefix and first 4 digits (missing last digit risk).
+            """
+            head, tail = split_plate_parts(selected_plate)
+            if head is None or tail is None or len(tail) != 4:
+                return False, None
+
+            matched_5digit = []
+            for cand in ocr_candidates:
+                c_head, c_tail = split_plate_parts(cand)
+                if c_head is None or c_tail is None:
+                    continue
+                if c_head == head and len(c_tail) == 5 and c_tail.startswith(tail):
+                    matched_5digit.append(f"{c_head}-{c_tail}")
+
+            if not matched_5digit:
+                return False, None
+
+            suggested = Counter(matched_5digit).most_common(1)[0][0]
+            return True, suggested
+
+        def select_confident_plate(plate_votes, ocr_candidates, min_votes=4, min_ratio=0.75):
+            """
+            Return a plate only when OCR votes are stable enough and tail length (4/5)
+            is not ambiguous. This is used to protect check-in accuracy.
+            """
+            if len(plate_votes) < min_votes:
+                return "unknown", "COLLECTING"
+
+            candidate, count = Counter(plate_votes).most_common(1)[0]
+            vote_ratio = count / float(len(plate_votes))
+            if vote_ratio < min_ratio:
+                return "unknown", "UNSTABLE"
+
+            if not is_valid_plate_format(candidate):
+                return "unknown", "INVALID"
+
+            ambiguous_tail, suggested_plate = detect_missing_last_digit_ambiguity(candidate, ocr_candidates)
+            if ambiguous_tail:
+                return "unknown", f"AMBIGUOUS:{candidate}:{suggested_plate}"
+
+            return candidate, "OK"
+
         def cosine_sim(a, b):
             if a is None or b is None: return 0.0
             try:
@@ -212,6 +269,7 @@ class CameraWorker(QThread):
         # Variables
         current_plate = "unknown"
         plate_history = deque(maxlen=5)
+        plate_ocr_candidates = deque(maxlen=15)
         last_action_time = 0.0
         last_checkin_by_plate = {}
         recently_checkout_plates = {}
@@ -222,8 +280,9 @@ class CameraWorker(QThread):
         stable_face_emb = None
         last_checkin_time = 0.0
         
-        plate_ocr_every_n_frames = 1
+        plate_ocr_every_n_frames = 2
         plate_frame_idx = 0
+        plate_status = "COLLECTING"
         
         while self.running:
             now = time.time()
@@ -238,14 +297,23 @@ class CameraWorker(QThread):
                 ret2, frame_plate = cap_plate.read()
                 if ret2:
                     plate_frame_idx += 1
+                    # Chi quet bien so moi 3 frame
                     if plate_frame_idx % plate_ocr_every_n_frames == 0:
                         # Chi quet bien so trong khung ROI cua Camera 2
                         plate_roi, _ = self.get_plate_roi(frame_plate)
                         p_cnd = extract_license_plate(plate_roi)
-                        if p_cnd != "unknown": plate_history.append(p_cnd)
-                        current_plate = Counter(plate_history).most_common(1)[0][0] if plate_history else "unknown"
+                        if p_cnd != "unknown":
+                            p_norm = str(p_cnd).upper().strip()
+                            plate_history.append(p_norm)
+                            plate_ocr_candidates.append(p_norm)
+                        current_plate, plate_status = select_confident_plate(
+                            plate_history,
+                            plate_ocr_candidates,
+                            min_votes=4,
+                            min_ratio=0.75,
+                        )
 
-                    # Convert and emit Plate Frame
+                    # Convert and emit Plate Frame (moi frame)
                     display_frame_plate = self.draw_alignment_boxes(frame_plate, False)
                     rgb_plate = cv2.cvtColor(display_frame_plate, cv2.COLOR_BGR2RGB)
                     h, w, ch = rgb_plate.shape
@@ -305,6 +373,20 @@ class CameraWorker(QThread):
                 stable_start_time, stable_plate, stable_face_emb = None, None, None
                 plate_history.clear()
                 current_plate = "unknown"
+
+            if current_plate == "unknown" and plate_status.startswith("AMBIGUOUS:"):
+                parts = plate_status.split(":", 2)
+                old_plate = parts[1] if len(parts) > 1 else "?"
+                new_plate = parts[2] if len(parts) > 2 else "?"
+                if can_overwrite_status:
+                    self.emit_status(
+                        f"Biển số mơ hồ 4/5 số ({old_plate} vs {new_plate}). Rollback để quét lại chính xác...",
+                        (255, 165, 0),
+                    )
+                    status_hold_until = now + self.EVENT_MESSAGE_HOLD_SECONDS
+                stable_start_time, stable_plate, stable_face_emb = None, None, None
+                plate_history.clear()
+                continue
 
             # ----- LOGIC CHECKIN/OUT CORE -----
             if person_data is not None and current_plate != "unknown" and is_valid_plate_format(current_plate) and stable_ready and can_trigger_action:
